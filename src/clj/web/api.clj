@@ -14,6 +14,7 @@
    [ring.util.response :refer [resource-response]]
    [reitit.middleware :as middleware]
    [web.admin :as admin]
+   [web.agent-api :as agent-api]
    [web.api-keys :as api-keys]
    [web.auth :as auth]
    [web.chat :as chat]
@@ -92,6 +93,24 @@
      ["/forgot" {:post #'auth/forgot-password-handler :middleware [::forgery]}]
      ["/logout" {:middleware [::auth ::forgery]
                  :post #'auth/logout-handler}]
+     ;; API-key authenticated endpoints for local agents (no CSRF: these are
+     ;; not cookie-authenticated, so cross-site forgery does not apply).
+     ["/agent-api" {:middleware [wrap-add-cache-headers]}
+      ["/lobbies" {:get #'agent-api/lobbies-handler}]
+      ["/lobby"
+       ["" {:get #'agent-api/lobby-handler}]
+       ["/create" {:post #'agent-api/create-lobby-handler}]
+       ["/join" {:post #'agent-api/join-handler}]
+       ["/watch" {:post #'agent-api/watch-handler}]
+       ["/leave" {:post #'agent-api/leave-handler}]
+       ["/deck" {:post #'agent-api/select-deck-handler}]
+       ["/start" {:post #'agent-api/start-handler}]]
+      ["/decks" {:get #'agent-api/decks-handler}]
+      ["/state" {:get #'agent-api/state-handler}]
+      ["/status" {:get #'agent-api/status-handler}]
+      ["/action" {:post #'agent-api/action-handler}]
+      ["/say" {:post #'agent-api/say-handler}]
+      ["/concede" {:post #'agent-api/concede-handler}]]
      ["/game" {:middleware [::forgery
                             ::cors
                             wrap-add-cache-headers]}

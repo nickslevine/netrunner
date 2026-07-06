@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""nr — command-line client for the jinteki.net agent API (/agent-api).
+
+Lets a program (or a person in a terminal) join, watch, and play Netrunner
+games against the browser client, using only HTTP. Designed to be driven by
+coding agents; every command prints JSON or compact text and exits nonzero on
+failure.
+
+Configuration (either works):
+  env vars:  JNET_URL (default http://localhost:1042), JNET_API_KEY
+  file:      ~/.config/jnet-agent.json  {"url": "...", "api_key": "..."}
+
+Get an API key by logging into the account the agent should use in the
+browser: Settings -> Create API Keys.
+
+Typical loop for a playing agent:
+  nr lobbies                 # find the game (needs 'Allow API access' on)
+  nr join <gameid>           # join it (or: nr create / nr watch)
+  nr wait                    # block until it's your turn or a prompt is up
+  nr status                  # whose turn, credits, prompt, log
+  nr state                   # full JSON game state (your view)
+  nr play <card>             # ... take actions ...
+  nr choose 0                # answer prompts
+  nr end-turn
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_PATH = os.path.expanduser("~/.config/jnet-agent.json")
+
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    url = os.environ.get("JNET_URL") or cfg.get("url") or "http://localhost:1042"
+    api_key = os.environ.get("JNET_API_KEY") or cfg.get("api_key")
+    return url.rstrip("/"), api_key
+
+
+def request(method, path, body=None, params=None, timeout=35):
+    url, api_key = load_config()
+    if not api_key:
+        die("No API key configured. Run: nr config --api-key <key> "
+            "(create one in the browser under Settings -> Create API Keys)")
+    full = url + path
+    if params:
+        full += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(full, data=data, method=method)
+    req.add_header("X-JNet-API", api_key)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode())
+        except (json.JSONDecodeError, ValueError):
+            payload = {"message": str(e)}
+        die(f"HTTP {e.code}: {payload.get('message', payload)}")
+    except urllib.error.URLError as e:
+        die(f"Cannot reach {url}: {e.reason}. Is the server running? (lein repl / bin/up)")
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def out(data):
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def act(command, args=None):
+    return request("POST", "/agent-api/action", {"command": command, "args": args or {}})
+
+
+def resolve_gameid(prefix):
+    """Allow passing a unique gameid prefix instead of the full uuid."""
+    if len(prefix) >= 36:
+        return prefix
+    lobbies = request("GET", "/agent-api/lobbies").get("lobbies", [])
+    matches = [l["gameid"] for l in lobbies if l["gameid"].startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        die(f"No lobby with gameid starting '{prefix}'")
+    die(f"Ambiguous gameid prefix '{prefix}': {matches}")
+
+
+# ---------------------------------------------------------------- rendering
+
+def render_card(c, show_cid=True):
+    if not isinstance(c, dict):
+        return str(c)
+    title = c.get("title") or ("(facedown)" if not c.get("seen", True) or not c.get("title") else "?")
+    bits = [title]
+    if c.get("advance-counter"):
+        bits.append(f"adv:{c['advance-counter']}")
+    counters = c.get("counter") or {}
+    for k, v in counters.items():
+        if v:
+            bits.append(f"{k}:{v}")
+    if c.get("rezzed"):
+        bits.append("rezzed")
+    if c.get("disabled"):
+        bits.append("disabled")
+    if c.get("strength") is not None:
+        bits.append(f"str:{c['strength']}")
+    if show_cid and c.get("cid"):
+        bits.append(f"cid:{c['cid'][:8]}")
+    hosted = c.get("hosted") or []
+    s = " ".join(bits)
+    if hosted:
+        s += " hosting[" + "; ".join(render_card(h) for h in hosted) + "]"
+    return s
+
+
+def render_board(payload):
+    st = payload["state"]
+    lines = []
+    lines.append(f"# {payload['perspective']} view — turn {st.get('turn')} "
+                 f"— active: {st.get('active-player')} — version {payload['version']}")
+    if st.get("winner"):
+        lines.append(f"*** GAME OVER: {st['winner']} wins ({st.get('reason')}) ***")
+    for side in ("corp", "runner"):
+        s = st.get(side, {})
+        ident = (s.get("identity") or {}).get("title", "?")
+        lines.append(f"\n== {side.upper()} — {ident} ==")
+        lines.append(f"credits:{s.get('credit')} clicks:{s.get('click')} "
+                     f"points:{s.get('agenda-point')} hand:{len(s.get('hand') or [])}"
+                     + (f" tags:{s.get('tag', {}).get('base')}" if side == "runner" else
+                        f" bad-pub:{s.get('bad-publicity', {}).get('base')}"))
+        hand = s.get("hand") or []
+        if hand and any(isinstance(c, dict) and c.get("title") for c in hand):
+            lines.append("hand:")
+            for c in hand:
+                lines.append(f"  - {render_card(c)}")
+        if side == "corp":
+            servers = s.get("servers") or {}
+            order = ["hq", "rd", "archives"] + sorted(k for k in servers if k.startswith("remote"))
+            for name in order:
+                srv = servers.get(name)
+                if not srv:
+                    continue
+                lines.append(f"server {name}:")
+                for i, ice in enumerate(srv.get("ices") or []):
+                    lines.append(f"  ice[{i}]: {render_card(ice)}")
+                for c in srv.get("content") or []:
+                    lines.append(f"  content: {render_card(c)}")
+        else:
+            rig = s.get("rig") or {}
+            for row in ("program", "hardware", "resource", "facedown"):
+                cards = rig.get(row) or []
+                if cards:
+                    lines.append(f"{row}s: " + "; ".join(render_card(c) for c in cards))
+        scored = s.get("scored") or []
+        if scored:
+            lines.append("scored: " + "; ".join(render_card(c) for c in scored))
+        discard = s.get("discard") or []
+        if discard:
+            lines.append(f"discard ({len(discard)}): "
+                         + "; ".join(render_card(c, show_cid=False) for c in discard[-8:]))
+    run = st.get("run")
+    if run:
+        lines.append(f"\nRUN on {run.get('server')} — phase {run.get('phase')} "
+                     f"position {run.get('position')}")
+    enc = st.get("encounters")
+    if enc:
+        lines.append(f"ENCOUNTER: {render_card(enc.get('ice') or {})}")
+    me = payload["perspective"].lower()
+    if me in ("corp", "runner"):
+        prompt = (st.get(me) or {}).get("prompt-state")
+        if prompt:
+            lines.append("\nPROMPT: " + str(prompt.get("msg")))
+            choices = prompt.get("choices")
+            if isinstance(choices, list):
+                for i, ch in enumerate(choices):
+                    val = ch.get("value")
+                    if isinstance(val, dict):
+                        val = val.get("title", val)
+                    lines.append(f"  [{i}] {val}")
+            elif choices:
+                lines.append(f"  (choices: {choices} — answer with a number: nr choose --number N)")
+    log = st.get("log") or []
+    if log:
+        lines.append("\nrecent log:")
+        for entry in log[-12:]:
+            text = entry.get("text") if isinstance(entry, dict) else str(entry)
+            lines.append(f"  {text}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_config(a):
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+    if a.url:
+        cfg["url"] = a.url
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"wrote {CONFIG_PATH}")
+
+
+def cmd_lobbies(a):
+    out(request("GET", "/agent-api/lobbies"))
+
+
+def cmd_lobby(a):
+    out(request("GET", "/agent-api/lobby"))
+
+
+def cmd_create(a):
+    body = {"title": a.title, "format": a.format, "side": a.side,
+            "password": a.password, "spectatorhands": a.spectatorhands,
+            "open-decklists": a.open_decklists}
+    if a.precon:
+        body["precon"] = a.precon
+        body["format"] = "preconstructed"
+    if a.gateway_type:
+        body["gateway-type"] = a.gateway_type
+        body["format"] = "system-gateway"
+    out(request("POST", "/agent-api/lobby/create", {k: v for k, v in body.items() if v is not None}))
+
+
+def cmd_join(a):
+    body = {"gameid": resolve_gameid(a.gameid)}
+    if a.side:
+        body["request-side"] = a.side
+    if a.password:
+        body["password"] = a.password
+    out(request("POST", "/agent-api/lobby/join", body))
+
+
+def cmd_watch(a):
+    body = {"gameid": resolve_gameid(a.gameid)}
+    if a.side:
+        body["request-side"] = a.side
+    if a.password:
+        body["password"] = a.password
+    out(request("POST", "/agent-api/lobby/watch", body))
+
+
+def cmd_leave(a):
+    out(request("POST", "/agent-api/lobby/leave", {}))
+
+
+def cmd_decks(a):
+    out(request("GET", "/agent-api/decks"))
+
+
+def cmd_deck(a):
+    body = {"deck-id": a.name} if len(a.name) == 24 and all(c in "0123456789abcdef" for c in a.name) \
+        else {"name": a.name}
+    out(request("POST", "/agent-api/lobby/deck", body))
+
+
+def cmd_start(a):
+    out(request("POST", "/agent-api/lobby/start", {}))
+
+
+def cmd_status(a):
+    params = {}
+    if a.since:
+        params = {"since": a.since, "wait-ms": 25000}
+    out(request("GET", "/agent-api/status", params=params))
+
+
+def cmd_state(a):
+    payload = request("GET", "/agent-api/state")
+    if a.board:
+        print(render_board(payload))
+    else:
+        out(payload)
+
+
+def cmd_board(a):
+    print(render_board(request("GET", "/agent-api/state")))
+
+
+def cmd_wait(a):
+    """Block until it's our turn to do something (or the game ends)."""
+    deadline = time.time() + a.timeout
+    status = request("GET", "/agent-api/status")
+    while time.time() < deadline:
+        if status.get("winner") or status.get("prompt") or status.get("your-turn"):
+            break
+        status = request("GET", "/agent-api/status",
+                         params={"since": status["version"], "wait-ms": 25000})
+    out(status)
+
+
+def cmd_prompt(a):
+    status = request("GET", "/agent-api/status")
+    out(status.get("prompt"))
+
+
+def choose_by_value(value):
+    """Answer the current prompt by (case-insensitive) choice text."""
+    status = request("GET", "/agent-api/status")
+    prompt = status.get("prompt")
+    choices = prompt.get("choices") if prompt else None
+    if not isinstance(choices, list):
+        die(f"No prompt with listed choices (prompt: {prompt and prompt.get('msg')})")
+    for ch in choices:
+        if str(ch.get("value", "")).strip().lower() == value.strip().lower():
+            return out(act("choice", {"choice": {"uuid": ch["uuid"]}}))
+    die(f"No choice matching '{value}'; choices: {[c.get('value') for c in choices]}")
+
+
+def cmd_choose(a):
+    if a.number is not None:
+        out(act("choice", {"choice": a.number}))
+        return
+    if a.text is not None:
+        out(act("choice", {"choice": a.text}))
+        return
+    if a.uuid:
+        out(act("choice", {"choice": {"uuid": a.uuid}}))
+        return
+    if a.value:
+        choose_by_value(a.value)
+        return
+    status = request("GET", "/agent-api/status")
+    prompt = status.get("prompt")
+    if not prompt or not isinstance(prompt.get("choices"), list):
+        die("No listed choices to pick from (see: nr prompt)")
+    try:
+        choice = prompt["choices"][a.index]
+    except IndexError:
+        die(f"Choice index {a.index} out of range; prompt has {len(prompt['choices'])} choices")
+    out(act("choice", {"choice": {"uuid": choice["uuid"]}}))
+
+
+def cmd_act(a):
+    args = json.loads(a.args) if a.args else {}
+    out(act(a.command, args))
+
+
+def cmd_say(a):
+    out(request("POST", "/agent-api/say", {"text": " ".join(a.text)}))
+
+
+def cmd_log(a):
+    status = request("GET", "/agent-api/status")
+    for line in status.get("log", [])[-a.n:]:
+        print(line)
+
+
+def cmd_concede(a):
+    out(request("POST", "/agent-api/concede", {}))
+
+
+def simple(command, **fixed):
+    def run(a):
+        args = dict(fixed)
+        if hasattr(a, "card") and a.card:
+            args["card"] = a.card
+        if hasattr(a, "server") and getattr(a, "server", None):
+            args["server"] = a.server
+        out(act(command, args))
+    return run
+
+
+def main():
+    p = argparse.ArgumentParser(prog="nr", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_, args=()):
+        sp = sub.add_parser(name, help=help_)
+        for spec in args:
+            sp.add_argument(*spec[0], **spec[1])
+        sp.set_defaults(fn=fn)
+        return sp
+
+    add("config", cmd_config, "save server url / api key", [
+        (["--url"], {}), (["--api-key"], {})])
+    add("lobbies", cmd_lobbies, "list lobbies on the server")
+    add("lobby", cmd_lobby, "show the lobby you are in")
+    add("create", cmd_create, "create a lobby (API access enabled)", [
+        (["--title"], {}), (["--format"], {"default": "standard"}),
+        (["--side"], {"choices": ["Corp", "Runner", "Any Side"], "default": "Any Side"}),
+        (["--password"], {}),
+        (["--precon"], {"help": "preconstructed matchup key"}),
+        (["--gateway-type"], {"choices": ["beginner", "intermediate"],
+                              "help": "system gateway starter game (auto decks)"}),
+        (["--spectatorhands"], {"action": "store_true"}),
+        (["--open-decklists"], {"action": "store_true"})])
+    add("join", cmd_join, "join a lobby as a player", [
+        (["gameid"], {}), (["--side"], {"choices": ["Corp", "Runner"]}), (["--password"], {})])
+    add("watch", cmd_watch, "spectate a game", [
+        (["gameid"], {}),
+        (["--side"], {"choices": ["Corp", "Runner"], "help": "see this side's perspective"}),
+        (["--password"], {})])
+    add("leave", cmd_leave, "leave the current lobby/game")
+    add("decks", cmd_decks, "list your saved decks")
+    add("deck", cmd_deck, "select a deck by name or id", [(["name"], {})])
+    add("start", cmd_start, "start the game (lobby creator only)")
+
+    add("status", cmd_status, "compact game status (prompt, credits, log)", [
+        (["--since"], {"help": "long-poll until version differs"})])
+    add("state", cmd_state, "full game state JSON (your view)", [
+        (["--board"], {"action": "store_true", "help": "render as text instead"})])
+    add("board", cmd_board, "human-readable board rendering")
+    add("wait", cmd_wait, "block until you have a prompt or the turn", [
+        (["--timeout"], {"type": int, "default": 300})])
+    add("prompt", cmd_prompt, "show the current prompt")
+    add("choose", cmd_choose, "answer a prompt", [
+        (["index"], {"type": int, "nargs": "?", "default": 0,
+                     "help": "index into the prompt's choices"}),
+        (["--uuid"], {"help": "choose by uuid"}),
+        (["--number"], {"type": int, "help": "for numeric prompts (credits, etc.)"}),
+        (["--text"], {"help": "for card-title prompts"}),
+        (["--value"], {"help": "choose by choice text, e.g. --value 'No action'"})])
+    add("act", cmd_act, "send a raw engine command", [
+        (["command"], {}), (["args"], {"nargs": "?", "help": "JSON args"})])
+    add("say", cmd_say, "chat in the game", [(["text"], {"nargs": "+"})])
+    add("log", cmd_log, "print recent game log", [(["-n"], {"type": int, "default": 15})])
+    add("concede", cmd_concede, "concede the game")
+
+    card = (["card"], {"help": "card cid or exact title"})
+    add("keep", lambda a: choose_by_value("Keep"), "keep opening hand")
+    add("mulligan", lambda a: choose_by_value("Mulligan"), "mulligan opening hand")
+    add("start-turn", simple("start-turn"), "start your turn")
+    add("end-turn", simple("end-turn"), "end your turn")
+    add("end-phase-12", simple("end-phase-12"), "end start-of-turn paid ability window")
+    add("credit", simple("credit"), "click for a credit")
+    add("draw", simple("draw"), "click to draw a card")
+    add("play", simple("play"), "play/install a card from hand", [card])
+    add("run", simple("run"), "initiate a run", [
+        (["server"], {"help": "HQ, R&D, Archives, Server 1, ..."})])
+    add("continue", simple("continue"), "continue to next run phase (no action)")
+    add("jack-out", simple("jack-out"), "jack out of the run")
+    add("rez", simple("rez"), "rez a card (corp)", [card])
+    add("derez", simple("derez"), "derez a card (corp)", [card])
+    add("advance", simple("advance"), "advance a card (corp)", [card])
+    add("score", simple("score"), "score an agenda (corp)", [card])
+    add("trash", simple("trash"), "trash a card", [card])
+    add("purge", simple("purge"), "purge virus counters (corp)")
+    add("remove-tag", simple("remove-tag"), "spend click+2c to remove a tag (runner)")
+    add("select", simple("select"), "select a card for a select-prompt", [card])
+    ab = add("ability", None, "use a card ability", [card,
+              (["index"], {"type": int, "help": "zero-based ability index"})])
+    ab.set_defaults(fn=lambda a: out(act("ability", {"card": a.card, "ability": a.index})))
+    sb = add("subroutine", None, "fire a subroutine (corp, during encounter)", [card,
+              (["index"], {"type": int})])
+    sb.set_defaults(fn=lambda a: out(act("subroutine", {"card": a.card, "subroutine": a.index})))
+    ub = add("break", None, "auto-break: pump and break with a breaker", [card])
+    ub.set_defaults(fn=lambda a: out(act("dynamic-ability",
+                                         {"card": a.card, "dynamic": "auto-pump-and-break"})))
+    us = add("fire-unbroken", None, "fire all unbroken subs (corp)", [card])
+    us.set_defaults(fn=lambda a: out(act("unbroken-subroutines", {"card": a.card})))
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -4,6 +4,19 @@ Hosted at [http://www.jinteki.net](http://www.jinteki.net). [Example of gameplay
 
 ![screenshot](http://i.imgur.com/xkxOMHc.jpg)
 
+## AI features (this fork)
+
+This fork adds an **agent API** (`/agent-api`) plus a `bin/nr` CLI so local
+coding agents can play against you or tutor you while you learn:
+
+- [docs/agent-play.md](docs/agent-play.md) — setup and how to play against /
+  learn from an agent
+- [docs/ai-design.md](docs/ai-design.md) — brainstorm/roadmap for non-LLM
+  Netrunner AI (heuristics, search, RL)
+- `.claude/skills/netrunner-agent` and `.claude/skills/netrunner-tutor` —
+  skills that turn Claude Code (or any agent that can read markdown and run a
+  CLI) into an opponent or a tutor
+
 ## Card implementation status
 
 [Card rules implementation status](https://docs.google.com/spreadsheets/d/1ICv19cNjSaW9C-DoEEGH3iFt09PBTob4CAutGex0gnE/pubhtml)

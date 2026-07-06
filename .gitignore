@@ -75,6 +75,7 @@ data/cards-zh-hans.edn
 data/cards-zh-hant.edn
 
 # Coding agents
-.claude/
+.claude/*
+!.claude/skills/
 .playwright-cli/
 .playwright/
