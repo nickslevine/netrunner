@@ -15,7 +15,9 @@
                      :max-age 5184000}}
  :web/lobby {:interval 1000
              :mongo #ig/ref :mongodb/connection
-             :time-inactive 600}
+             ;; Learning games pause a lot (reading cards, asking a tutor);
+             ;; give them an hour before inactivity cleanup, not 10 minutes.
+             :time-inactive 3600}
  :web/chat {:max-length 144
             ;; sliding window size in seconds
             :rate-window 60
