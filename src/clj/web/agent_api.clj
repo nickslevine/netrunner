@@ -43,10 +43,15 @@
                              (catch Exception _ nil))]
       (:username (mc/find-one-as-map db "api-keys" {:api-key api-uuid} ["username"])))))
 
-(defn- fetch-user [db username]
+(defn- fetch-user
+  "Loads the user like auth/wrap-user does, including stringifying :_id —
+  a raw ObjectId breaks the websocket serialization of any lobby this user
+  joins (browser clients would silently stop receiving lobby lists)."
+  [db username]
   (some-> (mc/find-one-as-map db "users" {:username username})
           (active-user?)
-          (select-keys user-keys)))
+          (select-keys user-keys)
+          (update :_id str)))
 
 (defn- wrap-agent
   "Authenticates the request via the X-JNet-API header and calls
